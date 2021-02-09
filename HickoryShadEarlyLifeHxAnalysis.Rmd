@@ -1,0 +1,625 @@
+---
+title: "Hickory Shad Otolith Microchemistry: Early Life History"
+output: html_notebook
+author: Christopher Ryan Hill
+---
+This R notebook contains the analysis that was conducted to investigate early life otolith element signatures in Hickory Shad
+-Analysis conducted by Christopher Ryan Hill
+```{r, results='hide'}
+library(tidyverse)
+library(depmixS4)
+library(cowplot)
+```
+
+Get the raw data and the index data from github
+
+- you have to click the file on github and click raw in the top right, and copy the url
+- RawData is a huge file, so it may take some time
+```{r}
+RawData<-read.csv("https://raw.githubusercontent.com/RH-7/Hickory-Shad-Otolith-Microchemistry/main/MasterChemData_6March2020.csv", header = T, sep = ",")
+```
+
+- `RawData` contains the raw chemistry data for each fish
+- There are 266731 observations 
+```{r}
+IndexData <- read.csv("https://raw.githubusercontent.com/RH-7/Hickory-Shad-Otolith-Microchemistry/main/CoreIndexData.csv", header = T, sep = ",")
+```
+
+- `IndexData` contains the index of the core point location for each fish which were selected by choosing the highest value of Zinc near the otolith core 
+
+- when selecting the core point, a 7-pt MA was applied to the data to remove noise, you found the highest value of Zn and subsetted the raw data using the index corresponding with that value of Zn
+
+In `RawData`:
+- make fishno and capture year a factor
+- remove calcium standard data and the data that is not in mols 
+```{r}
+RawData$Fishno <- as.factor(RawData$Fishno)
+RawData$CaptYr <- as.factor(RawData$CaptYr)
+RawData <- dplyr::select(RawData, -c(Ca.Int:Pb.O))
+```
+- RawData contains the complete raw chemistry data for each Hickory Shad
+- IndexData contains the index number of the data point chosen to represent the "core-point", which was found by picking the largest value at the distinct peak in zinc near each otolith core
+- There are 289 Hickory Shad from 16 locations ("rivers") within 18 major rivers or "ParentRivers" which collectively flow into 9 estuaries 
+
+Replace negative values in RawData with 0
+```{r}
+RawData[10:16] <- replace(RawData[10:16], RawData[10:16] < 0, 0)
+```
+The otoliths from these fish were analyzed backwards (dorsal to ventral instead of ventral to dorsal) during LA-ICP-MS, so you need to flip the data for them:
+
+- Choptank F1083
+- Pitchkettle F291
+- NeuseUpper M384
+- Pitchkettle M999
+- Cashie F612
+- Cashie F614
+- James F175
+- Potomac F1032
+
+```{r}
+RawData <- RawData%>%
+  dplyr::group_split(Fishno)%>%
+  map_dfr(~ if(any(c("1083", "291", "384", "999", "612", "614", "175", "1032") %in% first(.x$Fishno))) 
+    .x %>%
+      arrange(desc(distance)) else .x)
+```
+I will write a function to conduct the hidden markov models iteratively, it will be called synthesize
+- These objects will be used to store the output of the function
+
+```{r}
+RawSubsets <- list()#to store the raw data once it has been filtered from 1:Core
+hmmods <- list()#to store hidden markov models
+hmm.cpts <- list()#to store hidden markov change points
+output <- data.frame(
+      River = factor(),
+      Fishno = factor(), 
+      Mg.avg = numeric(),
+      Mn.avg = numeric(),
+      Sr.avg = numeric(),
+      Ba.avg = numeric(),
+      Zn.avg = numeric(),
+      Pb.avg = numeric(),
+      Cu.avg = numeric()
+    )
+```
+
+Now write the function
+```{r}
+synthesize <- 
+  function(id){
+    x <- dplyr::filter(RawData, Fishno == id)#subset the Fishno from RawData, save in x
+    v <- dplyr::filter(IndexData, Fishno == id)#subset the Fishno from IndexData, save in v
+    v <- as.numeric(v[5])#get the index number that goes with x
+    x <- x[1:v, ]#filter x from 1:v
+    x <- data.frame(map_df(x, rev))
+    x <- mutate(x, idx = row_number())#add an index column
+    newlist1 <- list(x)#make a list of x called newlist1
+    names(newlist1) <- paste0(x[1,1], x[1,6])#name it "x$Riverx$Fishno"
+    RawSubsets <<- c(RawSubsets, newlist1)#Store in RawSubsets list
+    hmmod <- depmix(SrCa ~ 1, family = gaussian(), nstates = 2, data = x)#fit hmm
+    PostProbs <- posterior(fit(hmmod))#get posterior probabilities
+    hmm.states <- with(PostProbs, which(state[-1] != state[-length(state)]))#save the changepoints
+    
+    newlist2 <- list(hmmod)#make a list of the hidden markov model
+    names(newlist2) <- paste0(x[1,1], x[1,6],".hmm")#name it "x$Riverx$Fishno.hmm"
+    hmmods <<- c(hmmods, newlist2)#store in hmmods list
+    newlist3 <- list(hmm.states)#make a list of the changepoints
+    names(newlist3) <- paste0(x[1,1], x[1,6],".cpts")#name it "x$Riverx$Fishno.cpts"
+    hmm.cpts <<- c(hmm.cpts, newlist3)#store it in hmm.cpts list
+    pt <- as.numeric(hmm.states[1])#get the first changepoint from Sr hmm
+    fwz <- dplyr::filter(x[1:pt,])#filter x through the changepoint
+    fwdata <- data.frame(
+      River = x[1,1],
+      Fishno = x[1,6],
+      Mg.avg = mean(fwz$MgCa),
+      Mn.avg = mean(fwz$MnCa),
+      Sr.avg = mean(fwz$SrCa),
+      Ba.avg = mean(fwz$BaCa),
+      Zn.avg = mean(fwz$ZnCa),
+      Pb.avg = mean(fwz$PbCa),
+      Cu.avg = mean(fwz$CuCa))
+
+    output <<- rbind(output, fwdata)
+
+   HMM.states <- hmm.states
+  }
+```
+Run the function:
+```{r, results='hide'}
+set.seed(123)
+fish <- levels(RawData$Fishno)
+lapply(fish, FUN=synthesize)
+```
+
+Round the continuous values to 2 decimal places 
+```{r}
+output[,3:9] <- round(output[,3:9], 2)
+```
+
+Store `output` in a data.frame called `fwdata` and use that (`fwdata`) from here on so that if you need to backtrack you can refer to `output` and not have to re-run `synthesize`
+
+```{r}
+fwdata <- output
+```
+
+Add the `ParentRiver` and `Estuary` grouping variables to `fwdata` to keep the dataset consistent.
+
+Note that some fish were captured in different branches or different areas of the same larger river system. This is what distinguishes the `River` and `ParentRiver` grouping variable. Some of these locations were very close in geographic proximity, likely to close to show detectable differences in element signatures. Preliminary analyses of the otolith edge signatures suggested that there were in fact no differences between these geographically similar locations. For this reason, we will only consider the `ParentRiver` grouping variable in this analysis
+
+```{r}
+fwdata[c("ParentRiver", "Estuary")] <- RawData[match(fwdata$River,RawData$River), ][c("ParentRiver","Estuary")]
+fwdata <- fwdata[ ,c(1,10,11,2:9)]
+```
+
+Check out the sample size of each `ParentRiver`
+```{r}
+fwdata%>%
+  group_by(ParentRiver)%>%
+  summarise(Count = n_distinct(Fishno))%>%
+  ggplot(aes(x=ParentRiver, y=Count))+
+  geom_bar(stat="identity")+
+  geom_text(aes(label = Count), vjust = -0.5)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))+
+  labs(x="Parent River", y="Number of Fish")+
+  ggtitle("Number of fish from each Parent River")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Rename the element columns
+```{r}
+colnames(fwdata)[5:11] <- c("Mg","Mn","Sr","Ba","Zn","Pb","Cu")
+```
+
+We know what river each of these fish were captured in, but we dont know which river they were born in. Therefore, when investigating early life element signatures, we cant assign hard labels to the data points. We want to know if fish that were captured in the same locations have similar element signatures in the early life regions of their otoliths, which would indicate they were likely born in the same locations and were returning there to spawn. 
+- This assumes that water chemistry is relatively stable over time
+
+Lets check out the distribution of each element
+
+```{r}
+library(ggpubr)
+```
+Make qqplots
+```{r, fig.width=14, fig.height=10}
+fwdata%>%
+  pivot_longer(-c(1:4), names_to = 'element', values_to='value')%>%
+  ggqqplot(., x='value', facet.by = 'element')
+```
+
+There are some concerning data points, im going to apply a square root transformation to approach normality and control the variance. 
+
+```{r}
+fwdata[,5:11] <- sqrt(fwdata[,5:11])
+```
+
+
+Run Pearson's correlation, ill use the rquery.cormat function
+```{r}
+source("http://www.sthda.com/upload/rquery_cormat.r")
+rquery.cormat(fwdata[,5:11])
+```
+
+There are some troublesome correlations between Zn, Cu, and Pb 
+- lets start by doing a pca and see if any of these seem to be unimportant variables  
+
+- ill use the factoextra package to do PCA
+```{r, results='hide'}
+library(FactoMineR)
+library(factoextra)
+library(knitr)
+```
+```{R results='asis'}
+pca<-PCA(fwdata[,5:11], scale.unit = T, ncp = 7, graph = F)
+```
+```{r}
+#get results for variables 
+pca.vars <- get_pca_var(pca) 
+#get results for individuals
+individs <- get_pca_ind(pca)
+#get eigenvalues
+eigs<-round(pca$eig,2) 
+```
+```{r}
+kable(eigs)
+```
+```{r}
+kable(round(pca.vars$contrib,2))
+```
+
+Plot the eigenvalues, and then variable contributions to the first 3 dimensions
+```{r, fig.width=14}
+eig.plot <- fviz_eig(pca, addlabels = T)#eigenvalues
+vc.pc1 <- fviz_contrib(pca, choice = "var", axes = 1, top = 10)#var contribs to pc1
+vc.pc2 <- fviz_contrib(pca, choice = "var", axes = 2, top = 10)#var contribs to pc2
+vc.pc3 <- fviz_contrib(pca, choice = "var", axes = 3, top = 10)#var contribs to pc3
+cowplot::plot_grid(eig.plot, vc.pc1, vc.pc2, vc.pc3, labels = "AUTO", nrow = 2)
+```
+
+Plot variable contributions to each pc
+```{r}
+corrplot(pca.vars$contrib, is.corr = F)#variable contributions to each pc
+```
+Plot total variable contributions to the first 3 principle components since they explain >75%
+- Just remember the dimensions are orthogonal
+```{r}
+fviz_contrib(pca, choice = "var", axes = 1:3, top = 10)
+```
+Lets use corrpot to view the quality of variable representation in each principle component
+```{r}
+corrplot(pca.vars$cos2, is.corr=F)
+```
+Now view the biplots of the first 3 dimensions
+```{r, fig.width=14}
+p1vp2 <- 
+  fviz_pca_biplot(pca, geom.ind = "point", pointsize=0, repel = T)+ 
+  ggtitle("Parent River PC1:PC2")+
+  geom_text(aes(label = paste0(fwdata$ParentRiver)), alpha = 0.5, size = 3, nudge_y = 0.1, show.legend = FALSE)
+p1vp3 <- 
+  fviz_pca_biplot(pca, axes=c(1,3), geom.ind = "point", pointsize=0, repel = T)+ 
+  ggtitle("Parent River PC1:PC3")+
+  geom_text(aes(label = paste0(fwdata$ParentRiver)), alpha = 0.5, size = 3, nudge_y = 0.1, show.legend = FALSE)
+p2vp3<- 
+  fviz_pca_biplot(pca, axes = c(2,3), geom.ind = "point", pointsize=0, repel = T)+ 
+  ggtitle("Parent River PC2:PC3")+
+  geom_text(aes(label = paste0(fwdata$ParentRiver)), alpha = 0.5, size = 3, nudge_y = 0.1, show.legend = FALSE)
+cowplot::plot_grid(p1vp2, p1vp3, p2vp3, labels = 'AUTO', nrow = 2)
+```
+Summary:
+- >75% of the variance is explained in the first 3 principle components and all of these have eigenvalues over 1 
+- all variables are well represented by pc3
+- Pb doesnt have much explanatory power so lets remove it to solve one collinearity issue 
+- Since Zn and Copper are so similar ill solve the other collinearity issue by analyzing the data twice, once with Zn and once with Cu
+
+Create Cu and Zn subsets
+```{r}
+Cu <- fwdata[,c(1:8,11)]
+Zn <- fwdata[,c(1:9)]
+```
+Center and scale them
+```{r}
+Cu[,5:9] <- scale(Cu[,5:9])
+Zn[,5:9] <- scale(Zn[,5:9])
+```
+
+
+```{r}
+library(factoextra)
+```
+
+using the factoextra package calculate hopkins test statistic to evaluate the clustering tendency of the data
+```{r}
+get_clust_tendency(Cu[,5:9], n=nrow(Cu)-1, graph = F)$hopkins_stat
+get_clust_tendency(Zn[,5:9], n=nrow(Zn)-1, graph = F)$hopkins_stat
+```
+```{r}
+get_clust_tendency(Cu[,5:9], n=nrow(Cu)-1, graph = T)
+get_clust_tendency(Zn[,5:9], n=nrow(Zn)-1, graph = T)
+```
+Now use the covRobust package to get a noise estimate, control for potential outliers using NNVE
+```{r, results='hide'}
+library(covRobust)
+```
+
+```{r}
+noise.est.Cu<- cov.nnve(Cu[,5:9])
+noise.Cu <- which(noise.est.Cu$classification==0) 
+noise.est.Zn<- cov.nnve(Zn[,5:9])
+noise.Zn <- which(noise.est.Zn$classification==0) 
+```
+Use the mclust package to do the GMMs
+```{r, results='hide'}
+library(mclust)
+```
+
+Use ICL to select the optimal covariance structure:
+
+```{r, results='hide'}
+set.seed(123)
+icl.Cu <- mclustICL(Cu[,5:9], initialization = list(noise = as.numeric(noise.Cu)))
+icl.Zn <- mclustICL(Zn[,5:9], initialization = list(noise = as.numeric(noise.Zn)))
+```
+```{r}
+icl.Cu
+icl.Zn
+```
+```{r}
+par(mfrow=c(1,2))
+plot(icl.Cu)
+plot(icl.Zn)
+```
+
+BIC selects model VVE for the Cu subset and model VEI for the Zn subset
+Use a bootstrap likelihood ratio test with those covariance structures to select the optimal number of mixture components
+
+```{r, results='hide'}
+set.seed(123)
+LRT.Cu<-mclustBootstrapLRT(Cu[,5:9], modelName = "VVE")
+LRT.Zn<-mclustBootstrapLRT(Zn[,5:9], modelName = "VEI")
+```
+```{r}
+LRT.Cu
+LRT.Zn
+```
+
+Make plots for the bootstrapped LRTs:
+```{r}
+par(mfrow = c(3,2))
+plot(LRT.Cu, G=1)
+plot(LRT.Cu, G=2)
+plot(LRT.Cu, G=3)
+plot(LRT.Cu, G=4)
+plot(LRT.Cu, G=5)
+```
+
+
+```{r}
+par(mfrow = c(3,2))
+plot(LRT.Zn, G=1)
+plot(LRT.Zn, G=2)
+plot(LRT.Zn, G=3)
+plot(LRT.Z n, G=4)
+plot(LRT.Zn, G=5)
+```
+
+
+Fit the models
+```{r echo=T, results='hide'}
+mod.Cu <- Mclust(Cu[,5:9], G=5, modelNames = "VVE")
+mod.Zn <- Mclust(Zn[,5:9], G=5, modelNames = "VEI")
+```
+```{r}
+summary(mod.Cu, parameters = T)
+summary(mod.Zn, parameters = T)
+```
+
+```{r}
+plot(mod.Cu, what = "classification")
+plot(mod.Zn, what = "classification")
+plot(mod.Cu, what = "density")
+plot(mod.Zn, what = "density")
+plot(mod.Cu, what = "uncertainty")
+plot(mod.Zn, what = "uncertainty")
+```
+Lets check out observations with high uncertainty:
+```{r}
+head(sort(mod.Cu$uncertainty, decreasing = T), 20)
+head(sort(mod.Zn$uncertainty, decreasing = T), 20)
+```
+- Most were less than 50%
+
+Bootstrap the models using bs and wlbs
+```{r echo=T, results='hide'}
+set.seed(123)
+boot.Cu <- MclustBootstrap(mod.Cu, type = "bs")
+boot.Zn <- MclustBootstrap(mod.Zn, type = "bs")
+wlboot.Cu <- MclustBootstrap(mod.Cu, nboot = 999, type = "wlbs")
+wlboot.Zn <- MclustBootstrap(mod.Zn, nboot = 999, type = "wlbs")
+```
+Now calculate bootstrap standard errors and confidence intervals
+- Compare results using a nonparametric bootstrap and a weighted likelihood bootstrap 
+```{r, fig.width=14}
+boot.ci.Cu <- summary(boot.Cu, what = "ci") 
+wlboot.ci.Cu <- summary(wlboot.Cu, what = "ci") 
+par(mfrow = c(1,5)) 
+for(j in 1:mod.Cu$G) { 
+  plot(1:mod.Cu$G, mod.Cu$parameters$mean[j,], col = 1:mod.Cu$G, pch = 15, 
+       ylab = colnames(Cu[,5:9])[j], 
+       xlab = "Mixture component", 
+       ylim = range(boot.ci.Cu$mean,wlboot.ci.Cu$mean), 
+       xlim = c(.5,mod.Cu$G+.5), xaxt = "n") 
+  points(1:mod.Cu$G+0.2, mod.Cu$parameters$mean[j,], col = 1:mod.Cu$G, pch = 15) 
+  axis(side = 1, at = 1:mod.Cu$G) 
+  with(boot.ci.Cu, errorBars(1:G, mean[1,j,], mean[2,j,], col = 1:G)) 
+  with(wlboot.ci.Cu, errorBars(1:G+0.2, mean[1,j,], mean[2,j,], col = 1:G, lty = 2)) } 
+```
+```{r, fig.width=14}
+boot.ci.Zn <- summary(boot.Zn, what = "ci") 
+wlboot.ci.Zn <- summary(wlboot.Zn, what = "ci")
+par(mfrow = c(1,5))
+for(j in 1:mod.Zn$G) { 
+  plot(1:mod.Zn$G, mod.Zn$parameters$mean[j,], col = 1:mod.Zn$G, pch = 15, 
+       ylab = colnames(Zn[,5:9])[j], 
+       xlab = "Mixture component", 
+       ylim = range(boot.ci.Zn$mean,wlboot.ci.Zn$mean), 
+       xlim = c(.5,mod.Zn$G+.5), xaxt = "n") 
+  points(1:mod.Zn$G+0.2, mod.Zn$parameters$mean[j,], col = 1:mod.Zn$G, pch = 15) 
+  axis(side = 1, at = 1:mod.Zn$G) 
+  with(boot.ci.Zn, errorBars(1:G, mean[1,j,], mean[2,j,], col = 1:G)) 
+  with(wlboot.ci.Zn, errorBars(1:G+0.2, mean[1,j,], mean[2,j,], col = 1:G, lty = 2)) } 
+par(mfrow = c(1,1))
+```
+The difference is negligable so ill just report the regular bootstrap 
+
+Plot mixing proportions:
+```{r, fig.width=14}
+par(mfrow = c(4,3)) 
+plot(boot.Cu, what = "pro")
+plot(boot.Zn, what = "pro")
+```
+
+
+Add a cluster column to the data to identify which cluster each fish was assigned to 
+```{r}
+Cu <- cbind(Cu, mod.Cu$classification)
+Zn <- cbind(Zn, mod.Zn$classification)
+names(Cu)[10] <- "cluster"
+names(Zn)[10] <- "cluster"
+```
+
+
+Im going to use the names a and b to manipulate the Cu subset, and ill use c and d to manipulate the Zn subset
+```{r}
+a<-
+Cu%>%
+  dplyr::select(5:10)%>%
+  dplyr::group_by(cluster)%>%
+  summarise_all(mean)%>%
+  pivot_longer(-c("cluster"), names_to = "Vars", values_to = "mean")
+
+b<-summary(boot.Cu, what = "se")$mean
+b <- as.data.frame(t(b))
+b$cluster <- 1:5
+b<-pivot_longer(b,-c("cluster"), names_to = "Vars", values_to = "mean")
+a$SE <- b$mean
+a$cluster <- as.factor(a$cluster)
+c <- Zn%>%
+  dplyr::select(5:10)%>%
+  dplyr::group_by(cluster)%>%
+  summarise_all(mean)%>%
+  pivot_longer(-c("cluster"), names_to = "Vars", values_to = "mean")
+d<-summary(boot.Zn, what = "se")$mean
+d <- as.data.frame(t(d))
+d$cluster <- 1:5
+d<-pivot_longer(d,-c("cluster"), names_to = "Vars", values_to = "mean")
+c$SE <- d$mean
+c$cluster <- as.factor(c$cluster)
+```
+
+
+```{r}
+a$Vars <- factor(a$Vars, levels = c("Sr", "Ba", "Mg", "Mn", "Cu"))
+c$Vars <- factor(c$Vars, levels = c("Sr", "Ba", "Mg", "Mn", "Zn"))
+col1 <- c("1" = "red", "2" = "blue", "3" = "black", "4" = "green", "5" = "purple")
+col2 <- c("1" = "red", "2" = "blue", "3" = "green", "4" = "black", "5" = "purple")
+p1<-
+ggplot(a, aes(x=Vars, y=mean, group=cluster)) + 
+  geom_line(aes(colour=cluster), show.legend = F)+
+  geom_point()+
+  scale_color_manual(values = col1)+
+  geom_errorbar(aes(ymin=mean-SE, ymax=mean+SE), width = .1)+
+    labs(title = "Cu Subset", x = "Element", y = "Cluster Average +/- SE")+
+    theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))
+p2<-
+ggplot(c, aes(x=Vars, y=mean, group=cluster)) + 
+  geom_line(aes(colour=cluster))+
+  geom_point()+
+  scale_color_manual(name = "Cluster", values = col2, labels = c("A","B","C","D","E"))+
+  geom_errorbar(aes(ymin=mean-SE, ymax=mean+SE), width = .1)+
+    labs(title = "Zn Subset", x = "Element", y = "Cluster Average +/- SE")+
+    theme_bw() +
+    theme(legend.justification=c(1,0),
+          legend.position=c(0.99,0.65),
+          plot.title = element_text(hjust = 0.5))
+```
+So while making the figure below, I realized that the model assigned 5 clusters to both subsets of the data, but the "name" of each cluster (i.e., cluster 1 through 5) was irrelevant with respect to the two different models. What I am interested in however, is which clusters have similar elemental characteristics. For instance, there was a cluster in both subsets that had the highest Sr and the lowest Ba (and similar characteristics with respect to the other elementts), and the majority of St. John fish were assigned to this cluster in both subsets. Convieniently, both models named the cluster with these characteristics "cluster 1". The same pattern is true for clusters 2 and 5, but clusters 3 and 4 are flipped between the data subsets. To avoid this confusion when making the figures for publication, I have taken several steps in the code to re-name the clusters A:E so that the clusters with the same names now have the same elemental characteristics
+```{r, fig.width=14, fig.height=6}
+cowplot::plot_grid(p1,p2, labels = "AUTO")
+```
+
+```{r, include=F}
+#final.lineplot<-
+ # cowplot::plot_grid(p1,p2,
+  #                 labels = 'AUTO')
+#save_plot("ClusterAveragePlot.jpg", final.lineplot, base_height = 6, base_width = 14)
+```
+```{r}
+Cu.sum<- 
+Cu%>%
+  dplyr::count(ParentRiver, cluster)%>%
+  group_by(ParentRiver)%>%
+  mutate(n = n / sum(n))%>%
+  pivot_wider(names_from = cluster, values_from = n)%>%
+  inner_join(count(Cu, ParentRiver, name = "total"))
+Cu.sum[,2:6] <- 100*Cu.sum[,2:6]
+Cu.sum[,2:6] <- round(Cu.sum[,2:6],0)
+Cu.sum[is.na(Cu.sum)] <- 0
+#put these in correct order:
+Cu.sum <- Cu.sum[,c(1,4,2,5,3,6,7)]
+
+
+Zn.sum<- 
+Zn%>%
+  count(ParentRiver, cluster)%>%
+  group_by(ParentRiver)%>%
+  mutate(n = n / sum(n))%>%
+  pivot_wider(names_from = cluster, values_from = n)%>%
+  inner_join(count(Zn, ParentRiver, name = "total"))
+Zn.sum[,2:6] <- 100*Zn.sum[,2:6]
+Zn.sum[,2:6] <- round(Zn.sum[,2:6],0)
+Zn.sum[is.na(Zn.sum)] <- 0 
+#Put these in correct order:
+Zn.sum <- Zn.sum[,c(1,4,5,2,3,6,7)]
+```
+So I know from making the previous plots that what the model named cluster 3 and 4 are flipped between the subsets:
+- Cluster 3 in the Cu subset has similar characteristics to cluster 4 in the Zn subset, and cluster 4 in the Cu subset has similar characteristics to cluster 3 in the Zn subset
+- thankfully the rest are fine
+
+I want to make barplots to show the percent of each ParentRiver that was assigned to each cluster with similar elemental characteristics, so to fix the issue with clusters 3 and 4 I will just flip them when I assign letters to them:
+```{r}
+Cu.sum <- data.frame(Cu.sum)
+colnames(Cu.sum)<- c("ParentRiver", "A", "B", "C", "D", "E", "total")
+Cu.sum$ParentRiver <- factor(Cu.sum$ParentRiver, levels = c("Susq","Pata","Chop","Patux","Poto","Nant","Rapp","James","Chow","Roan","Pam","Neuse","CF","Wacca","SS","Ogee","Alt","StJo"))
+
+Zn.sum <- data.frame(Zn.sum)
+colnames(Zn.sum)<- c("ParentRiver", "A", "B", "D", "C", "E", "total")
+Zn.sum$ParentRiver <- factor(Zn.sum$ParentRiver, levels = c("Susq","Pata","Chop","Patux","Poto","Nant","Rapp","James","Chow","Roan","Pam","Neuse","CF","Wacca","SS","Ogee","Alt","StJo"))
+```
+
+Now make the plots, each bar will show the original sample size from each ParentRiver, and the bars will be colored proportionally according to the percent of Hickory Shad that were assigned to each cluster of similar elemental characteristics 
+
+```{r}
+Cu.barplot<-
+Cu.sum %>%
+   pivot_longer(-c(ParentRiver,total), names_to= "Cluster", values_to = "val") %>%
+   mutate(val1 = val * total / 100)%>%
+  ggplot(., aes(x=ParentRiver, y=val1, fill = Cluster))+
+  geom_bar(stat = "identity", show.legend = F)+
+  geom_text(aes(y = total, label = ifelse(Cluster == "A", total, "")), nudge_y = 2, size = 4)+
+  geom_text(aes(y = val1, 
+                label = ifelse(val > 0, scales::percent(val, scale = 1, accuracy = 1), "")), 
+            position = position_stack(vjust = .6), size = 2.5)+
+  labs(title = "Cu Subset",x="Parent River", y="Sample Size/Percent Cluster Assignment")+
+  theme(plot.title = element_text(hjust = 0.5), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.background = element_rect(fill= "white"),
+        axis.line = element_line(colour = 'black'))
+Zn.barplot<-
+Zn.sum%>%
+   pivot_longer(-c(ParentRiver,total), names_to= "Cluster", values_to = "val") %>%
+   mutate(val1 = val * total / 100)%>%
+  ggplot(., aes(x=ParentRiver, y=val1, fill = Cluster))+
+  geom_bar(stat = "identity")+
+  geom_text(aes(y = total, label = ifelse(Cluster == "A", total, "")), nudge_y = 2, size = 4) +
+  geom_text(aes(y = val1, 
+                label = ifelse(val > 0, scales::percent(val, scale = 1, accuracy = 1), "")), 
+            position = position_stack(vjust = .6), size = 2.5)+
+  labs(title = "Zn Subset",x="Parent River", y="Sample Size/Percent Cluster Assignment")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5), 
+        panel.background = element_rect(fill= "white"),
+        axis.line = element_line(colour = 'black'),
+        legend.position = c(0.95,0.75))
+  
+```
+
+```{r, fig.width=14, fig.height=7}
+cowplot::plot_grid(Cu.barplot,Zn.barplot,
+                   labels = 'AUTO')
+```
+```{r, include=F}
+#final.barplot<-
+ # cowplot::plot_grid(Cu.barplot,Zn.barplot,
+  #                 labels = 'AUTO')
+#save_plot("ClusterBarPlot.jpg", final.barplot, base_height = 6, base_width = 11)
+```
+
+
+So in most cases, the majority of fish (>50%) from one river system were assigned to the same cluster, meaning fish from the same river systems had similar natal river element signatures
+
+To confirm that their is a significant relationship between ParentRiver and cluster assignment, I am going to use a Chi-Square test of independence, and I will generate a distribution of 2000 Chi-Square test statistics to compare the observed value.
+
+```{r}
+chisq.test(Cu$ParentRiver, Cu$cluster)
+```
+
+```{r}
+chisq.test(Cu$ParentRiver, Cu$cluster, simulate.p.value = T)
+```
+
+```{r}
+chisq.test(Zn$ParentRiver, Zn$cluster)
+```
+```{r}
+chisq.test(Zn$ParentRiver, Zn$cluster, simulate.p.value = T)
+```
+
